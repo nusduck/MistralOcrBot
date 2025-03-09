@@ -40,6 +40,7 @@ python bot.py
 1. Start a chat with your bot on Telegram
 2. Send `/start` to get started
 3. Send any image or PDF document to the bot
+4. Send `/link URL` to download the file then extract text using OCR
 4. The bot will process the file and extract text using OCR
 5. Choose your preferred download format (Text or Markdown)
 
