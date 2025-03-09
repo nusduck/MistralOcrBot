@@ -6,6 +6,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 import base64
 from io import BytesIO
+import aiohttp
+import urllib.parse
+import mimetypes
 
 from mistralai import Mistral
 from mistralai import DocumentURLChunk, ImageURLChunk, TextChunk
@@ -35,7 +38,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send me a PDF or image, and I'll extract the text using Mistral OCR.\n\n"
         "Commands:\n"
         "/start - Show this help message\n"
-        "/help - Show help information"
+        "/help - Show help information\n"
+        "/link [URL] - Process a file from URL"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -45,7 +49,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "This bot uses Mistral's OCR technology to extract text from documents.\n\n"
         "To use it, simply send:\n"
         "- 📸 An image (.jpg, .png, etc.)\n"
-        "- 📄 A PDF document\n\n"
+        "- 📄 A PDF document\n"
+        "- 🔗 Use /link [URL] to process a file from URL\n\n"
         "The bot will process your file and return the extracted text."
     )
 
@@ -276,7 +281,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.message.reply_document(
                     document=file,
                     filename="extracted_text.txt",
-                    caption="📄 Here's your extracted file! 🎉"
+                    caption="🎉 Here's your extracted file! "
                 )
         
         elif format_type == "md":
@@ -285,12 +290,110 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.message.reply_document(
                     document=file,
                     filename="extracted_content.md",
-                    caption="📄 Here's your extracted file! 🎉"
+                    caption="🎉 Here's your extracted file! "
                 )
         
         elif format_type == "cancel":
             # Cancel the operation and remove the keyboard
             await query.message.edit_text("❌ Operation cancelled")
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process a file from a URL link."""
+    # Extract URL from command
+    args = context.args
+    if not args or len(args) < 1:
+        await update.message.reply_text("请在/link命令后提供URL链接。\n使用格式: /link http://example.com/file.pdf")
+        return
+    
+    url = args[0]
+    
+    # Validate URL format
+    try:
+        result = urllib.parse.urlparse(url)
+        if all([result.scheme, result.netloc]):
+            # URL is valid format
+            pass
+        else:
+            await update.message.reply_text("无效URL。请提供有效的http://或https://链接")
+            return
+    except:
+        await update.message.reply_text("URL格式无效。请检查您的链接。")
+        return
+    
+    # Send processing message
+    processing_message = await update.message.reply_text("⏳ 正在从URL下载并处理文件。这可能需要一点时间...")
+    
+    try:
+        # Download the file
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    await processing_message.edit_text(f"❌ 文件下载失败。状态码: {response.status}")
+                    return
+                
+                # Try to get filename from content-disposition header or URL
+                content_disposition = response.headers.get('Content-Disposition')
+                if content_disposition and 'filename=' in content_disposition:
+                    filename = content_disposition.split('filename=')[1].strip('"\'')
+                else:
+                    filename = url.split('/')[-1]
+                
+                # Determine file extension
+                content_type = response.headers.get('Content-Type', '')
+                extension = mimetypes.guess_extension(content_type)
+                if not extension:
+                    # Try to get extension from filename or URL
+                    extension = Path(filename).suffix
+                    if not extension:
+                        # Default to .pdf for documents, .jpg for images
+                        if 'image' in content_type:
+                            extension = '.jpg'
+                        else:
+                            extension = '.pdf'
+                
+                # Check if file type is supported
+                if extension.lower() not in ['.pdf', '.jpg', '.jpeg', '.png']:
+                    await processing_message.edit_text(
+                        f"❌ 不支持的文件类型 ({extension})。请提供PDF或图片文件链接 (jpg, jpeg, png)。"
+                    )
+                    return
+                
+                # Download to temporary file
+                file_content = await response.read()
+                with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as temp_file:
+                    temp_file.write(file_content)
+                    temp_file_path = Path(temp_file.name)
+        
+        # Upload file to Mistral
+        with open(temp_file_path, 'rb') as f:
+            uploaded_file = mistral_client.files.upload(
+                file={
+                    "file_name": filename,
+                    "content": f.read(),
+                },
+                purpose="ocr",
+            )
+        
+        # Get signed URL
+        signed_url = mistral_client.files.get_signed_url(file_id=uploaded_file.id, expiry=5)
+        
+        # Process using OCR
+        ocr_response = mistral_client.ocr.process(
+            document=DocumentURLChunk(document_url=signed_url.url), 
+            model="mistral-ocr-latest", 
+            include_image_base64=True
+        )
+        
+        # Clean up temp file
+        if temp_file_path.exists():
+            os.unlink(temp_file_path)
+        
+        # Process response
+        await send_ocr_results(update, context, ocr_response, processing_message)
+        
+    except Exception as e:
+        logger.error(f"Error processing file from URL: {e}")
+        await processing_message.edit_text(f"❌ 从URL处理文件时出错: {str(e)}")
 
 def main() -> None:
     """Start the bot."""
@@ -300,6 +403,7 @@ def main() -> None:
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("link", link_command))  # 添加新命令处理器
     application.add_handler(MessageHandler(filters.PHOTO, process_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, process_document))
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -310,4 +414,4 @@ def main() -> None:
     application.run_polling()
 
 if __name__ == "__main__":
-    main() 
+    main()
